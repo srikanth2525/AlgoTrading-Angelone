@@ -1,0 +1,181 @@
+from logzero import logger
+from SmartApi.smartConnect import SmartConnect
+import pyotp
+import pandas as pd
+from ta.momentum import RSIIndicator
+from datetime import datetime, timedelta
+import requests
+import yfinance as yf
+from time import sleep
+
+# Define your API credentials (replace with your actual credentials)
+api_key = 'n2ty0MP1'
+username = 'POTU1001'
+password = '1402'
+smartApi = SmartConnect(api_key)
+
+try:
+    # Replace with your actual 2FA token generation logic
+    token = "44OVM77VTHZYVMLWWLTOLS6ZQU"
+    totp = pyotp.TOTP(token).now()
+except Exception as e:
+    logger.error("Invalid Token: The provided token is not valid.")
+    raise e
+
+correlation_id = "abcde"
+data = smartApi.generateSession(username, password, totp)
+if data['status'] == False:
+    logger.error(data)
+else:
+    authToken = data['data']['jwtToken']
+    refreshToken = data['data']['refreshToken']
+    feedToken = smartApi.getfeedToken()
+    res = smartApi.getProfile(refreshToken)
+    res = res['data']['exchanges']
+    print(res)
+
+# Function to retrieve tokens for a list of symbols from Angel Broking API
+def get_tokens_for_symbols(symbols):
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    tokens = {}
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an exception for bad response status
+        
+        data = response.json()  # Parse JSON response
+        
+        for item in data:
+            if item['symbol'] in symbols:
+                tokens[item['symbol']] = item['token']
+        
+        for symbol in symbols:
+            if symbol not in tokens:
+                print(f"Symbol '{symbol}' not found in the response.")
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data from API: {e}")
+    
+    return tokens
+
+# Function to check if a candle is inside bar
+def is_inside_bar(df, i):
+    if df['High'][i] < df['High'][i-1] and df['Low'][i] > df['Low'][i-1]:
+        return True
+    else:
+        return False
+
+# Function to execute trade using Angel One Smart API
+def execute_trade(symbol, quantity, action, price, token, stop_loss_points, exit_price_points):
+    orderparams = {
+        "variety": "ROBO",  # Variety changed to ROBO
+        "tradingsymbol": symbol,
+        "symboltoken": token,
+        "transactiontype": action,
+        "exchange": "NSE",
+        "ordertype": "LIMIT",
+        "producttype": "BO",  # Assuming BO (Bracket Order) as product type for ROBO variety
+        "duration": "DAY",
+        "price": str(price),
+        "quantity": quantity,
+        "squareoff": str(exit_price_points),  # Setting square off as 2 times of stop loss
+        "stoploss": str(stop_loss_points),  # Specify stop loss in points
+    }
+
+    try:
+        order_id = smartApi.placeOrder(orderparams)
+        logger.info(f"Trade executed for {symbol}. Order ID: {order_id}")
+        return order_id
+    except Exception as e:
+        logger.error(f"Error executing trade for {symbol}: {e}")
+
+    return None
+
+# Function to backtest inside bar strategy and execute trades
+def backtest_and_execute_strategy(stocks, start, end, quantity=100):
+    all_trades = []
+    
+    # Get tokens for all symbols
+    symbols = [stock.replace('.NS', '-EQ') for stock in stocks]  # Convert symbols to required format
+    tokens = get_tokens_for_symbols(symbols)
+
+    for stock in stocks:
+        try:
+            df = yf.download(stock, start=start, end=end)
+            df['RSI'] = RSIIndicator(df['Close'], 14).rsi()
+
+            for i in range(1, len(df)):
+                if is_inside_bar(df, i-1):
+                    inside_bar_high = df['High'][i-1]
+                    inside_bar_low = df['Low'][i-1]
+
+                    # Additional conditions
+                    if 60 < df['RSI'][i] < 76 and df['RSI'][i-1] < 60 and df['RSI'][i] > df['RSI'][i-1]:
+                        # Entry conditions for next day
+                        entry_trigger_price = inside_bar_high + 0.5  # Example: Inside bar high + 0.5 points
+
+                        # Check if the next day's high crosses above the entry trigger price
+                        if df['High'][i] > entry_trigger_price:
+                            entry_price = entry_trigger_price
+                            stop_loss_points = entry_price - inside_bar_low
+                            exit_price_points = entry_price * 1.007 - entry_price  # 0.7% above entry price in points
+
+                            # Get token for current stock
+                            token = tokens.get(stock.replace('.NS', '-EQ'), "")
+
+                            # Execute trade using Smart API
+                            if token:
+                                order_id = execute_trade(stock.replace('.NS', '-EQ'), quantity, "BUY", entry_price, token, stop_loss_points, exit_price_points)
+                                if order_id:
+                                    # Sleep briefly to avoid rate limiting
+                                    sleep(1)
+
+                                    # Simulate real-time intraday behavior
+                                    current_time = datetime.now().time()
+                                    market_close_time = datetime.strptime("15:15", "%H:%M").time()
+
+                                    # Check exit conditions
+                                    if df.index[i] == df.index[-1] or current_time >= market_close_time:
+                                        # Get actual exit price based on current market data
+                                        exit_price = df['Close'][i]
+                                        profit_loss = (exit_price - entry_price) * quantity
+
+                                        # Prepare trade result data
+                                        entry_time = df.index[i].strftime('%Y-%m-%d')
+                                        exit_time = df.index[i].strftime('%Y-%m-%d')
+
+                                        trade_result = {
+                                            'Stock': stock,
+                                            'Entry Time': entry_time,
+                                            'Entry Price': entry_price,
+                                            'Exit Time': exit_time,
+                                            'Exit Price': exit_price,
+                                            'Profit/Loss': profit_loss,
+                                            'Stop Loss': stop_loss_points,
+                                            'Max Drawdown (%)': ((stop_loss_points) / entry_price) * 100  # Calculate max drawdown in percentage
+                                        }
+                                        all_trades.append(trade_result)
+                                        print(trade_result)
+
+                            else:
+                                logger.error(f"Token not found for {stock}. Skipping trade execution.")
+                                continue
+
+        except Exception as e:
+            logger.error(f"Error processing {stock}: {e}")
+
+    return pd.DataFrame(all_trades)
+
+# Example list of F&O stocks in the format LATENTVIEW.NS, etc.
+fno_stocks = ['RAILTEL.NS', 'RVNL.NS', 'HONASA.NS', 'KALYANKJIL.NS', 'GICRE.NS', 'SYRMA.NS', 'ZENSARTECH.NS', 'GRANULES.NS', 'VIPIND.NS', 'USHAMART.NS', 'ASTERDM.NS', 'RKFORGE.NS', 'LATENTVIEW.NS', 'VGUARD.NS', 'KFINTECH.NS', 'APLLTD.NS', 'HAPPSTMNDS.NS', 'HINDZINC.NS', 'JUBLFOOD.NS', 'JSWENERGY.NS', 'JSWINFRA.NS', 'CELLO.NS', 'OIL.NS', 'RHIM.NS', 'FINPIPE.NS', 'JINDALSTEL.NS', 'PETRONET.NS', 'PRINCEPIPE.NS', 'NAM-INDIA.NS', 'JAIBALAJI.NS', 'APOLLOTYRE.NS', 'CHALET.NS', 'SWSOLAR.NS', 'TRITURBINE.NS', 'SUNTECK.NS', 'MHRIL.NS', 'PNCINFRA.NS', 'RITES.NS', 'HINDALCO.NS', 'JINDALSAW.NS', 'JYOTHYLAB.NS', 'BIKAJI.NS', 'VAIBHAVGBL.NS', 'INTELLECT.NS', 'ERIS.NS', 'SWANENERGY.NS', 'BIOCON.NS', 'JSWSTEEL.NS', 'RECLTD.NS', 'HOMEFIRST.NS', 'SUNTV.NS', 'NTPC.NS', 'JWL.NS', 'FDC.NS', 'INDIANB.NS', 'POWERGRID.NS', 'SONATSOFTW.NS', 'BALRAMCHIN.NS', 'VIJAYA.NS', 'PFC.NS', 'UNOMINDA.NS', 'MFSL.NS', 'FIVESTAR.NS', 'FORTIS.NS', 'ACI.NS', 'AUBANK.NS', 'MAHSEAMLES.NS', 'ASAHIINDIA.NS', 'SAREGAMA.NS', 'VEDL.NS', 'CGPOWER.NS', 'QUESS.NS', 'SADBHAV.NS', 'ASTERDM.NS', 'SKFINDIA.NS', 'TVTODAY.NS', 'BIRLACORPN.NS', 'TATAMOTORS.NS', 'MRPL.NS', 'HCLTECH.NS', 'CREDITACC.NS', 'CENTURYPLY.NS', 'PFIZER.NS', 'IBVENTURES.NS', 'JAMNAAUTO.NS', 'WIPRO.NS', 'HFCL.NS', 'NH.NS', 'ZEELEARN.NS', 'RAMCOIND.NS', 'GICHSGFIN.NS', 'APLLTD.NS', 'TCS.NS', 'POLYCAB.NS', 'TRENT.NS', 'BLUEDART.NS', 'IBULHSGFIN.NS', 'HINDCOPPER.NS', 'MAITHANALL.NS', 'SWSOLAR.NS', 'TATASTEEL.NS', 'RELIANCE.NS', 'HINDUNILVR.NS', 'ASHOKLEY.NS', 'HDFC.NS', 'MFSL.NS', 'DRREDDY.NS', 'MINDTREE.NS', 'FSL.NS', 'BHARATFORG.NS', 'BHEL.NS', 'BPCL.NS', 'ICICIPRULI.NS', 'ADANIPORTS.NS', 'TVSMOTOR.NS', 'DIVISLAB.NS', 'ITC.NS', 'AUBANK.NS', 'TATACONSUM.NS', 'SAIL.NS', 'LICHSGFIN.NS', 'LALPATHLAB.NS', 'TATAMOTORS.NS', 'AMBUJACEM.NS', 'NATIONALUM.NS', 'GMRINFRA.NS', 'HDFCLIFE.NS', 'M&MFIN.NS', 'APLLTD.NS', 'NATCOPHARM.NS', 'APOLLOHOSP.NS', 'TATACHEM.NS', 'GRANULES.NS', 'TATAPOWER.NS', 'ULTRACEMCO.NS', 'GODREJPROP.NS', 'BANDHANBNK.NS', 'HDFCBANK.NS', 'SBILIFE.NS', 'GLENMARK.NS', 'TITAN.NS', 'NTPC.NS', 'IOC.NS', 'BIOCON.NS', 'LUPIN.NS', 'MUTHOOTFIN.NS', 'DLF.NS', 'ADANIGREEN.NS', 'PIDILITIND.NS', 'NTPC.NS', 'INFY.NS', 'JUBLFOOD.NS', 'IGL.NS', 'OBEROIRLTY.NS', 'TATAELXSI.NS', 'IRCTC.NS', 'NAUKRI.NS', 'IBULHSGFIN.NS', 'RELIANCE.NS', 'ICICIBANK.NS', 'ONGC.NS', 'KOTAKBANK.NS', 'MOTHERSUMI.NS', 'TCS.NS', 'DABUR.NS', 'LALPATHLAB.NS', 'TRENT.NS', 'GRASIM.NS', 'BAJAJHLDNG.NS', 'TECHM.NS', 'HCLTECH.NS', 'APOLLOTYRE.NS', 'ACC.NS', 'MARICO.NS', 'SUNTV.NS', 'APOLLOHOSP.NS', 'SUNPHARMA.NS', 'HDFC.NS', 'EICHERMOT.NS', 'NAUKRI.NS', 'ADANIGREEN.NS', 'LUPIN.NS', 'SHREECEM.NS', 'ITC.NS', 'DIVISLAB.NS', 'JUBLFOOD.NS', 'DRREDDY.NS', 'SRTRANSFIN.NS', 'UPL.NS', 'HINDUNILVR.NS', 'TITAN.NS', 'NESTLEIND.NS', 'HDFCLIFE.NS', 'DIXON.NS', 'RELIANCE.NS', 'ASIANPAINT.NS', 'IOC.NS', 'ADANIPORTS.NS', 'INFY.NS', 'WIPRO.NS', 'KOTAKBANK.NS', 'TCS.NS', 'BHARTIARTL.NS', 'ONGC.NS', 'MARUTI.NS', 'JSWSTEEL.NS', 'BAJAJFINSV.NS', 'BAJAJ-AUTO.NS', 'ICICIBANK.NS', 'POWERGRID.NS', 'NTPC.NS', 'HINDUNILVR.NS', 'BAJFINANCE.NS', 'AXISBANK.NS', 'SBILIFE.NS', 'ULTRACEMCO.NS', 'HDFCBANK.NS', 'HDFC.NS', 'BRITANNIA.NS', 'TATACONSUM.NS', 'NESTLEIND.NS', 'HCLTECH.NS', 'TITAN.NS', 'JSWSTEEL.NS', 'ITC.NS', 'NTPC.NS', 'SHREECEM.NS', 'RELIANCE.NS', 'DIVISLAB.NS', 'TCS.NS', 'HINDUNILVR.NS', 'WIPRO.NS', 'ADANIPORTS.NS', 'NATIONALUM.NS', 'ICICIBANK.NS', 'SBILIFE.NS', 'DRREDDY.NS', 'AXISBANK.NS', 'SBIN.NS', 'HDFCLIFE.NS', 'TATASTEEL.NS', 'ULTRACEMCO.NS', 'BPCL.NS', 'HDFCBANK.NS', 'BAJFINANCE.NS', 'HDFC.NS', 'TITAN.NS', 'TATAMOTORS.NS', 'RELIANCE.NS', 'TCS.NS', 'JSWSTEEL.NS', 'ITC.NS', 'DIVISLAB.NS', 'SBILIFE.NS', 'NTPC.NS', 'HINDUNILVR.NS', 'AXISBANK.NS', 'SHREECEM.NS', 'WIPRO.NS', 'ICICIBANK.NS', 'HDFCLIFE.NS', 'BRITANNIA.NS', 'ULTRACEMCO.NS', 'HDFC.NS', 'ADANIPORTS.NS', 'NATIONALUM.NS', 'DRREDDY.NS', 'TATASTEEL.NS', 'SBILIFE.NS', 'SBIN.NS', 'AXISBANK.NS', 'ICICIBANK.NS', 'HDFCLIFE.NS', 'TITAN.NS', 'HDFCBANK.NS', 'NTPC.NS', 'DIVISLAB.NS', 'HINDUNILVR.NS', 'WIPRO.NS', 'JSWSTEEL.NS', 'TCS.NS', 'ITC.NS', 'RELIANCE.NS', 'HDFC.NS', 'ULTRACEMCO.NS', 'ICICIBANK.NS', 'TATAMOTORS.NS', 'TCS.NS', 'AXISBANK.NS', 'HDFCBANK.NS', 'HDFCLIFE.NS', 'ITC.NS', 'DIVISLAB.NS', 'HINDUNILVR.NS', 'TITAN.NS', 'SBILIFE.NS', 'RELIANCE.NS', 'NTPC.NS', 'WIPRO.NS', 'SHREECEM.NS', 'ULTRACEMCO.NS', 'DRREDDY.NS', 'HDFC.NS', 'ICICIBANK.NS', 'TATASTEEL.NS', 'HDFCLIFE.NS', 'AXISBANK.NS', 'BRITANNIA.NS', 'TCS.NS', 'ITC.NS', 'DIVISLAB.NS', 'HINDUNILVR.NS', 'HDFCBANK.NS', 'SBILIFE.NS', 'JSWSTEEL.NS', 'RELIANCE.NS', 'ULTRACEMCO.NS', 'NTPC.NS', 'TITAN.NS', 'WIPRO.NS', 'ADANIPORTS.NS', 'SHREECEM.NS', 'ICICIBANK.NS', 'HDFC.NS', 'HDFCLIFE.NS', 'AXISBANK.NS', 'ITC.NS', 'HINDUNILVR.NS', 'DIVISLAB.NS', 'SBILIFE.NS', 'TCS.NS', 'RELIANCE.NS', 'ULTRACEMCO.NS', 'HDFCBANK.NS', 'NTPC.NS', 'JSWSTEEL.NS', 'WIPRO.NS', 'TITAN.NS', 'ICICIBANK.NS', 'HDFC.NS', 'HINDUNILVR.NS', 'HDFCLIFE.NS', 'SBILIFE.NS', 'DIVISLAB.NS', 'TCS.NS', 'AXISBANK.NS', 'ULTRACEMCO.NS', 'RELIANCE.NS', 'NTPC.NS', 'ITC.NS', 'HDFCBANK.NS', 'JSWSTEEL.NS', 'TITAN.NS', 'WIPRO.NS', 'ICICIBANK.NS', 'HDFC.NS', 'HDFCLIFE.NS', 'HINDUNILVR.NS', 'SBILIFE.NS', 'DIVISLAB.NS', 'TCS.NS', 'ULTRACEMCO.NS', 'AXISBANK.NS', 'RELIANCE.NS', 'ITC.NS', 'HDFCBANK.NS', 'JSWSTEEL.NS', 'TITAN.NS', 'WIPRO.NS', 'HDFC.NS', 'HDFCLIFE.NS', 'ICICIBANK.NS', 'SBILIFE.NS', 'DIVISLAB.NS', 'TCS.NS', 'ULTRACEMCO.NS', 'RELIANCE.NS', 'AXISBANK.NS', 'HDFCBANK.NS', 'ITC.NS', 'JSWSTEEL.NS', 'TITAN.NS', 'WIPRO.NS']
+
+# Define start and end dates for backtesting
+start_date = '2024-05-20'
+end_date = '2024-06-24'
+
+# Backtest and execute strategy on F&O stocks
+trades_df = backtest_and_execute_strategy(fno_stocks, start_date, end_date)
+
+# Display trades DataFrame
+print(trades_df)
+trades_df.to_csv('output_inside_bar_final.csv', index=False)
